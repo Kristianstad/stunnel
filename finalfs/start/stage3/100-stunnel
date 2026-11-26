@@ -1,0 +1,130 @@
+#!/bin/sh
+# Secure and Minimal, stage3 for stunnel.
+#
+# Runs as root (reduced capabilities) during container startup, before
+# VAR_FINAL_COMMAND. It
+#   1. makes sure a certificate and a private key exist (self-signed if none
+#      are provided), and
+#   2. generates VAR_CONFIG_FILE from the VAR_* parameters, unless a non-empty
+#      configuration file is already in place.
+#
+# All work is done in a subshell function, so the script is safe to both
+# execute and source: nothing leaks into the calling shell.
+
+stunnel_stage3() (
+    set -eu
+
+    user="${VAR_LINUX_USER:-stunnel}"
+    cfg="${VAR_CONFIG_FILE:-/etc/stunnel/generated.conf}"
+    crt="${VAR_CERT_FILE:-/etc/stunnel/stunnel.pem}"
+    key="${VAR_KEY_FILE:-/etc/stunnel/stunnel.key}"
+    ca="${VAR_CA_FILE:-/etc/ssl/certs/ca-certificates.crt}"
+    cn="${VAR_CERT_CN:-localhost}"
+    days="${VAR_CERT_DAYS:-365}"
+
+    service="${VAR_SERVICE:-stunnel}"
+    listen="${VAR_LISTEN_PORT:-8443}"
+    host="${VAR_HOST:-}"
+    port="${VAR_PORT:-}"
+    client="${VAR_CLIENT:-no}"
+    debug="${VAR_DEBUG:-5}"
+    delay="${VAR_DELAY:-no}"
+    verify="${VAR_VERIFY:-}"
+    verify_chain="${VAR_VERIFY_CHAIN:-no}"
+    protocol="${VAR_PROTOCOL:-}"
+    ciphers="${VAR_CIPHERS:-}"
+    psk="${VAR_PSKSECRETS_FILE:-}"
+
+    umask 077
+
+    fail() {
+        echo "stunnel: $*" >&2
+        exit 1
+    }
+
+    is_port() {
+        case "$1" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+    }
+
+    # Print "name = value", but only if value is non-empty.
+    opt() {
+        [ -z "$2" ] || printf '%s = %s\n' "$1" "$2"
+    }
+
+    # place <tmpfile> <destination> <mode>
+    # Files are written to a temporary name and renamed into place, so an
+    # existing (empty) destination never has to be writable by root itself.
+    place() {
+        chmod "$3" "$1"
+        mv -f "$1" "$2"
+        chown "$user" "$2" 2>/dev/null || chmod g+r "$2"
+    }
+
+    # Fail early, before any certificate is generated.
+    if [ ! -s "$cfg" ]; then
+        [ -n "$host" ] || fail "VAR_HOST is not set (host to connect to)"
+        is_port "$port" || fail "VAR_PORT must be a port number (port to connect to), got '$port'"
+        is_port "$listen" || fail "VAR_LISTEN_PORT must be a port number, got '$listen'"
+    fi
+
+    # --- 1. Certificate and private key --------------------------------------
+    if [ ! -s "$key" ]; then
+        [ ! -s "$crt" ] || fail "certificate $crt exists but private key $key is missing or empty"
+        case "$days" in ''|*[!0-9]*) fail "VAR_CERT_DAYS must be a number" ;; esac
+        case "$cn" in
+            *[!0-9.]*) san="DNS:$cn" ;;
+            *)         san="IP:$cn" ;;
+        esac
+        echo "stunnel: no private key at $key, generating a self-signed certificate (CN=$cn, $days days)" >&2
+        out=$(openssl req -x509 -nodes -newkey rsa:2048 -days "$days" \
+            -keyout "$key.new" -out "$crt.new" \
+            -subj "/CN=$cn" -addext "subjectAltName=$san" 2>&1) || {
+            echo "$out" >&2
+            fail "openssl failed to generate a self-signed certificate"
+        }
+        place "$key.new" "$key" 600
+        place "$crt.new" "$crt" 644
+    elif [ ! -s "$crt" ]; then
+        fail "private key $key exists but certificate $crt is missing or empty"
+    fi
+
+    # --- 2. Configuration ------------------------------------------------------
+    if [ -s "$cfg" ]; then
+        echo "stunnel: using existing configuration $cfg" >&2
+        exit 0
+    fi
+
+    {
+        cat <<EOF
+foreground = yes
+pid =
+debug = ${debug}
+socket = l:TCP_NODELAY=1
+socket = r:TCP_NODELAY=1
+sslVersionMin = TLSv1.2
+client = ${client}
+cert = ${crt}
+key = ${key}
+verifyChain = ${verify_chain}
+EOF
+        [ ! -s "$ca" ] || printf 'CAfile = %s\n' "$ca"
+        cat <<EOF
+
+[${service}]
+accept = ${listen}
+connect = ${host}:${port}
+delay = ${delay}
+EOF
+        opt verify "$verify"
+        opt protocol "$protocol"
+        opt ciphers "$ciphers"
+        [ ! -s "$psk" ] || printf 'PSKsecrets = %s\n' "$psk"
+    } > "$cfg.new"
+
+    place "$cfg.new" "$cfg" 600
+)
+
+stunnel_stage3 || exit 1
